@@ -1,0 +1,8 @@
+{
+  "name": "Lethal Ape",
+  "short_name": "LethalApe",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#05060f",
+  "theme_color": "#05060f"
+}
