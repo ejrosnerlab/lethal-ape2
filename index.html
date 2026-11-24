@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Lethal Ape</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="manifest" href="manifest.json"><meta name="theme-color" content="#05060f">
+<style>
+body{margin:0;overflow:hidden;background:#05060f;color:#eee;font-family:sans-serif}
+#menu{position:fixed;inset:0;overflow:auto;padding:16px;z-index:5;background:#05060f}
+.card{border:1px solid #444;border-radius:10px;padding:10px;margin:8px 0;max-width:520px}
+.card.sel{border-color:#e8b923}
+button,select,input{font-size:18px;padding:8px 14px;margin:4px 0;border-radius:8px;border:0}
+button{background:#e8b923;cursor:pointer}#enter{font-size:26px;padding:14px 40px}
+</style></head><body>
+<div id="menu"><h1>LETHAL APE</h1>
+<input id="name" placeholder="Name" maxlength="16"><br>
+<select id="mode">
+<option value="escape">Escape: find 5 keys, dodge AI monsters, reach the exit</option>
+<option value="monster">Be the Monster: one player hunts everyone else</option>
+<option value="brawl">Brawl: everyone is a monster, last one standing</option>
+</select>
+<div style="font-size:13px;opacity:.7">(The first player to join a server sets its mode.)</div>
+<h3>Choose your monster</h3><div id="forms"></div>
+<button id="enter">Enter VR</button><div id="status"></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js');
+const $=id=>document.getElementById(id), V3=THREE.Vector3;
+
+// ================= CONFIG =================
+const SERVER_URL='wss://YOUR-SERVER.example.com'; // your deployed server.js (must be wss://)
+const DEV_UNLOCK_ALL=true;   // set false for release and wire up real IAP in purchase()
+const HAND_R=.09, GRAV=9.8, MAXL=9;
+
+// ================= MONSTERS =================
+const FORMS={
+ human:{n:'Survivor',price:0,col:0x44aaff,d:''},
+ brute:{n:'The Brute',price:0,col:0x8a1a1a,d:'STARTER. Hold grip to grab: yank an arm to tear it off, yank a head to rip it off, grab a torso with both hands and pull apart to rip it in half. Fast punches break bones.'},
+ shifter:{n:'Shapeshifter',price:5,col:0x7a3a9a,d:'Press A/X near a player to copy their body. Your first hit from a disguise snaps their neck. B/Y drops the disguise.'},
+ spider:{n:'Spider Queen',price:5,col:0x1f5a2a,d:'Hold grip on any surface to stick and climb. B/Y shoots a web that slows a target.'},
+ banshee:{n:'Banshee',price:5,col:0xccccee,d:'A/X scream (12s cooldown): everyone within 8m is stunned and has an arm broken.'},
+ phantom:{n:'Phantom',price:5,col:0x223344,d:'A/X cloak for 6s (12s cooldown). Your next hit from cloak does double damage.'},
+ crusher:{n:'Bonecrusher',price:5,col:0x886644,d:'Hard punches shatter bones. Hit a broken arm again and it tears off.'}
+};
+let owned={human:1,brute:1};
+try{Object.assign(owned,JSON.parse(localStorage.getItem('la_owned')||'{}'))}catch(e){}
+const saveOwned=()=>{try{localStorage.setItem('la_owned',JSON.stringify(owned))}catch(e){}};
+let myForm='brute',myName='Ape'+(Math.random()*999|0),pickMode='escape';
+const myCol=new THREE.Color().setHSL(Math.random(),.7,.55).getHex();
+
+async function purchase(sku){
+ // TODO (release): call Meta Horizon IAP (Platform SDK) for this SKU and verify the receipt on YOUR server.
+ if(DEV_UNLOCK_ALL)return true;
+ throw new Error('IAP not wired up yet');
+}
+function buildMenu(){
+ const box=$('forms');box.innerHTML='';
+ for(const k in FORMS){if(k==='human')continue;const f=FORMS[k];
+  const d=document.createElement('div');d.className='card'+(myForm===k?' sel':'');
+  d.innerHTML='<b>'+f.n+'</b> <i>'+(f.price?'$'+f.price:'FREE')+'</i><p>'+f.d+'</p>';
+  const b=document.createElement('button');
+  if(owned[k]){b.textContent=myForm===k?'Selected':'Select';b.onclick=()=>{myForm=k;buildMenu()}}
+  else{b.textContent='Buy $'+f.price;b.onclick=async()=>{try{if(await purchase(k)){owned[k]=1;saveOwned();myForm=k;buildMenu()}}catch(e){alert(e.message)}}}
+  d.appendChild(b);box.appendChild(d);}
+}
+buildMenu();
+
+// ================= SCENE =================
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x05060f);scene.fog=new THREE.Fog(0x05060f,8,55);
+const camera=new THREE.PerspectiveCamera(70,innerWidth/innerHeight,.05,200);
+const rig=new THREE.Group();rig.add(camera);scene.add(rig);
+const renderer=new THREE.WebGLRenderer({antialias:true});renderer.setSize(innerWidth,innerHeight);renderer.xr.enabled=true;
+document.body.appendChild(renderer.domElement);
+scene.add(new THREE.HemisphereLight(0x8899ff,0x222211,.9));
+const moon=new THREE.DirectionalLight(0xaabbff,.6);moon.position.set(10,20,5);scene.add(moon);
+const ground=new THREE.Mesh(new THREE.PlaneGeometry(300,300),new THREE.MeshStandardMaterial({color:0x3a3a4a}));
+ground.rotation.x=-Math.PI/2;scene.add(ground);
+
+// ================= WORLD (seeded so every client matches) =================
+const solids=[];let worldObjs=[],keys=[],exitMesh=null;const exitPos=new V3();
+function mulberry(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function addBox(x,y,z,w,h,d,col){const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshStandardMaterial({color:col}));
+ m.position.set(x,y+h/2,z);scene.add(m);worldObjs.push(m);
+ solids.push({min:new V3(x-w/2,y,z-d/2),max:new V3(x+w/2,y+h,z+d/2)});}
+const inside=(x,z)=>solids.some(b=>x>b.min.x-.6&&x<b.max.x+.6&&z>b.min.z-.6&&z<b.max.z+.6);
+function buildWorld(seed){
+ worldObjs.forEach(o=>scene.remove(o));worldObjs=[];solids.length=0;keys=[];
+ const R=mulberry(seed),S=40;
+ addBox(0,0,-S,S*2,6,1,0x222233);addBox(0,0,S,S*2,6,1,0x222233);addBox(-S,0,0,1,6,S*2,0x222233);addBox(S,0,0,1,6,S*2,0x222233);
+ for(let i=0;i<70;i++){const x=(R()-.5)*(2*S-4),z=(R()-.5)*(2*S-4);if(Math.hypot(x,z)<5)continue;
+  addBox(x,0,z,1+R()*4,1+R()*6,1+R()*4,new THREE.Color().setHSL(.6,.15,.2+R()*.2));}
+ const rp=()=>{let x,z,n=0;do{x=(R()-.5)*66;z=(R()-.5)*66;n++}while(inside(x,z)&&n<30);return[x,z]};
+ for(let i=0;i<5;i++){const[x,z]=rp();const m=new THREE.Mesh(new THREE.OctahedronGeometry(.2),new THREE.MeshStandardMaterial({color:0xffd23f,emissive:0x886600}));
+  m.position.set(x,.7,z);scene.add(m);worldObjs.push(m);keys.push({m,got:false});}
+ let ex,ez;do{const a=R()*6.28;ex=Math.cos(a)*30;ez=Math.sin(a)*30}while(inside(ex,ez));
+ exitPos.set(ex,1.2,ez);
+ exitMesh=new THREE.Mesh(new THREE.TorusGeometry(1.2,.12,8,24),new THREE.MeshBasicMaterial({color:0xaa2222}));
+ exitMesh.position.copy(exitPos);scene.add(exitMesh);worldObjs.push(exitMesh);
+ keys.forEach(k=>k.m.visible=mode==='escape');exitMesh.visible=mode==='escape';
+}
+
+// ================= COLLISION =================
+const _n=new V3(),_cp=new V3(),_dd=new V3();
+function pushOut(p,r,out){let best=0;
+ if(p.y-r<0){best=r-p.y;out.set(0,1,0)}
+ for(const b of solids){_cp.set(Math.max(b.min.x,Math.min(p.x,b.max.x)),Math.max(b.min.y,Math.min(p.y,b.max.y)),Math.max(b.min.z,Math.min(p.z,b.max.z)));
+  _dd.copy(p).sub(_cp);const len=_dd.length();
+  if(len<r){let depth,n;if(len>1e-6){depth=r-len;n=_dd.multiplyScalar(1/len)}else{depth=(b.max.y-p.y)+r;n=_n.set(0,1,0)}
+   if(depth>best){best=depth;out.copy(n)}}}
+ return best;}
+
+// ================= HANDS + HUD =================
+const hc=document.createElement('canvas');hc.width=256;hc.height=160;const htex=new THREE.CanvasTexture(hc);
+const hud=new THREE.Mesh(new THREE.PlaneGeometry(.16,.1),new THREE.MeshBasicMaterial({map:htex,transparent:true}));
+hud.position.set(0,.07,.02);hud.rotation.x=-1;
+const hands=[0,1].map(i=>{
+ const c=renderer.xr.getController(i);
+ const mesh=new THREE.Mesh(new THREE.SphereGeometry(HAND_R,16,12),new THREE.MeshStandardMaterial({color:myCol}));
+ c.add(mesh);rig.add(c);
+ const h={c,mesh,prev:new V3(),first:true,touching:false,wasT:false,vel:new V3(),delta:new V3(),speed:0,gp:null,pb:{},anchor:null,grab:null,hw:new V3()};
+ c.addEventListener('connected',e=>{h.gp=e.data.gamepad;if(e.data.handedness==='left')c.add(hud)});
+ return h;});
+hands[0].c.add(hud);
+
+// ================= GAME STATE =================
+let mode='escape',banner='',connected=false,myId=0,hostId=0,ws=null;
+let round={on:false,over:false,sent:false,end:0,t0:0,keys:0,monsterId:null};
+const me={hp:6,mask:0,dead:false,team:'s',form:'human',stun:0,slow:0,cloak:0,cd:{a:0},disguise:null};
+const HP=new V3(),vel=new V3(),_zero=new V3(),_hw=new V3(),_hn=new V3(),_a=new V3(),_d2=new V3();
+let wasTouch=false;
+const isHost=()=>!connected||myId===hostId;
+const r3=a=>[+a.x.toFixed(2),+a.y.toFixed(2),+a.z.toFixed(2)];
+// mask bits: 1 left arm gone, 2 right arm gone, 4 head gone, 8 cut in half, 16/32 left/right arm broken, 128 dead
+
+function myColor(){return me.disguise?me.disguise.col:(me.form==='human'?myCol:FORMS[me.form].col)}
+function updateLook(){hands.forEach(h=>h.mesh.material.color.setHex(myColor()))}
+function effForm(){
+ if(mode==='escape')return'human';
+ if(mode==='monster')return round.monsterId===myId?(myForm==='human'?'brute':myForm):'human';
+ return myForm==='human'?'brute':myForm;}
+function drawHUD(){
+ const g=hc.getContext('2d');g.fillStyle='rgba(0,0,0,.75)';g.fillRect(0,0,256,160);
+ g.fillStyle='#fff';g.font='20px sans-serif';
+ const left=Math.max(0,(round.end-performance.now())/1000|0);
+ g.fillText(FORMS[me.form].n+(me.disguise?' (disguised)':''),8,24);
+ g.fillText('HP '+'♥'.repeat(Math.max(0,me.hp)),8,50);
+ g.fillText(mode.toUpperCase()+'  '+(left/60|0)+':'+String(left%60).padStart(2,'0'),8,76);
+ if(mode==='escape')g.fillText('Keys '+round.keys+'/5',8,102);
+ g.font='15px sans-serif';g.fillStyle='#ffd23f';g.fillText(banner.slice(0,32),8,150);
+ if(me.mask&128){g.fillStyle='#f44';g.font='22px sans-serif';g.fillText('DEAD',170,24)}
+ htex.needsUpdate=true;}
+
+// ================= SOUND / HAPTICS =================
+let actx;function sfx(f,d,type){try{actx=actx||new AudioContext();const o=actx.createOscillator(),g=actx.createGain();
+ o.type=type||'sawtooth';o.frequency.value=f;g.gain.value=.15;o.connect(g);g.connect(actx.destination);o.start();
+ g.gain.exponentialRampToValueAtTime(.001,actx.currentTime+d);o.stop(actx.currentTime+d)}catch(e){}}
+function haptic(h,s,ms){try{h.gp&&h.gp.hapticActuators&&h.gp.hapticActuators[0].pulse(s,ms)}catch(e){}}
+
+// ================= AVATARS =================
+const armGeo=new THREE.CylinderGeometry(.05,.04,1,8),_y=new V3(0,1,0),_dv=new V3();
+function makeAvatar(form,col){
+ const big=form!=='human',mat=new THREE.MeshStandardMaterial({color:col,transparent:true}),g=new THREE.Group();
+ const head=new THREE.Mesh(new THREE.SphereGeometry(big?.2:.17,14,10),mat);
+ const torso=new THREE.Mesh(new THREE.BoxGeometry(big?.5:.4,.6,.22),mat);
+ const hl=new THREE.Mesh(new THREE.SphereGeometry(big?.13:.09,12,8),mat),hr=hl.clone();
+ const al=new THREE.Mesh(armGeo,mat),ar=al.clone();
+ const eyeM=new THREE.MeshBasicMaterial({color:big?0xff2222:0xffffff});
+ for(const s of[-1,1]){const e=new THREE.Mesh(new THREE.SphereGeometry(.035,8,8),eyeM);e.position.set(s*.07,.03,-.15);head.add(e);
+  if(big){const hn=new THREE.Mesh(new THREE.ConeGeometry(.04,.18,6),mat);hn.position.set(s*.12,.17,0);hn.rotation.z=-s*.4;head.add(hn)}}
+ g.add(head,torso,hl,hr,al,ar);
+ return{g,head,torso,hl,hr,al,ar,mat,sL:new V3(),sR:new V3(),neck:new V3()};}
+function limb(m,a,b){_dv.subVectors(b,a);const L=_dv.length()||.001;m.position.copy(a).addScaledVector(_dv,.5);m.quaternion.setFromUnitVectors(_y,_dv.normalize());m.scale.set(1,L,1)}
+const _eu=new THREE.Euler();
+function poseAvatar(av,hp,hq,lp,rp,mask){
+ const yaw=_eu.setFromQuaternion(hq,'YXZ').y,c=Math.cos(yaw),s=Math.sin(yaw);
+ av.head.position.copy(hp);av.head.quaternion.copy(hq);
+ av.neck.set(hp.x,hp.y-.2,hp.z);
+ av.torso.position.set(hp.x,hp.y-.52,hp.z);av.torso.rotation.set(0,yaw,0);
+ av.sL.set(hp.x-c*.22,hp.y-.25,hp.z+s*.22);av.sR.set(hp.x+c*.22,hp.y-.25,hp.z-s*.22);
+ av.hl.position.copy(lp);av.hr.position.copy(rp);limb(av.al,av.sL,lp);limb(av.ar,av.sR,rp);
+ av.head.visible=!(mask&4);av.torso.visible=!(mask&8);
+ av.hl.visible=av.al.visible=!(mask&1);av.hr.visible=av.ar.visible=!(mask&2);
+ av.hl.scale.setScalar(mask&16?.7:1);av.hr.scale.setScalar(mask&32?.7:1);}
+
+// ================= GORE =================
+const chunks=[],bGeo=new THREE.SphereGeometry(.03,6,4),bMat=new THREE.MeshBasicMaterial({color:0xaa0000});
+function blood(p,n){for(let i=0;i<n&&chunks.length<320;i++){const m=new THREE.Mesh(bGeo,bMat);m.position.copy(p);scene.add(m);
+ chunks.push({m,b:1,v:new V3((Math.random()-.5)*4,Math.random()*3,(Math.random()-.5)*4),life:1+Math.random()*3})}}
+function chunk(kind,p,col){let m;const mat=new THREE.MeshStandardMaterial({color:col});
+ if(kind==='arm'){m=new THREE.Group();const c=new THREE.Mesh(new THREE.CylinderGeometry(.05,.04,.6,8),mat);c.rotation.z=Math.PI/2;
+  const h=new THREE.Mesh(new THREE.SphereGeometry(.1,10,8),mat);h.position.x=.3;m.add(c,h)}
+ else if(kind==='head')m=new THREE.Mesh(new THREE.SphereGeometry(.2,12,10),mat);
+ else m=new THREE.Mesh(new THREE.BoxGeometry(.45,.35,.25),mat);
+ m.position.copy(p);scene.add(m);
+ chunks.push({m,v:new V3((Math.random()-.5)*3,2+Math.random()*2,(Math.random()-.5)*3),life:40,r:new V3(Math.random()*6,Math.random()*6,0)});
+ if(chunks.length>320){const o=chunks.shift();scene.remove(o.m)}}
+function updChunks(dt){for(let i=chunks.length-1;i>=0;i--){const c=chunks[i];c.life-=dt;
+ if(c.life<=0){scene.remove(c.m);chunks.splice(i,1);continue}
+ c.v.y-=GRAV*dt;c.m.position.addScaledVector(c.v,dt);
+ const fl=c.b?.03:.1;if(c.m.position.y<fl){c.m.position.y=fl;c.v.set(0,0,0);if(c.r)c.r.set(0,0,0)}
+ if(c.r){c.m.rotation.x+=c.r.x*dt;c.m.rotation.y+=c.r.y*dt}}}
+function fxLocal(k,hp,lp,rp,col){
+ if(k==='armL'){chunk('arm',lp,col);blood(lp,30);sfx(90,.3)}
+ else if(k==='armR'){chunk('arm',rp,col);blood(rp,30);sfx(90,.3)}
+ else if(k==='head'){chunk('head',hp,col);blood(hp,50);sfx(130,.3)}
+ else if(k==='half'){const t=hp.clone();t.y-=.3;const b=hp.clone();b.y-=.7;chunk('half',t,col);chunk('half',b,col);blood(t,70);sfx(60,.5)}
+ else{blood(hp,12);sfx(180,.1,'square')}}
+function emitFx(k){fxLocal(k,HP,hands[0].hw,hands[1].hw,myColor());
+ net({t:'fx',k,p:r3(HP),l:r3(hands[0].hw),r:r3(hands[1].hw),c:myColor()})}
+
+// ================= DAMAGE (victim side) =================
+function hurt(n){if(me.dead||round.over)return;me.hp-=n;hands.forEach(h=>haptic(h,1,200));sfx(80,.2);blood(HP,8);if(me.hp<=0)die('dmg')}
+function die(k){if(me.dead)return;me.dead=true;me.mask|=128;emitFx(k);banner='You died'}
+function breakArm(i){const gone=1<<i,br=16<<i;if(me.mask&gone)return;
+ if(me.mask&br){tearArm(i);return}
+ me.mask|=br;hands.forEach(h=>haptic(h,1,300));sfx(220,.15,'square');emitFx('break');banner='Arm broken!'}
+function tearArm(i){if(me.mask&(1<<i))return;me.mask|=1<<i;emitFx(i?'armR':'armL');hurt(2)}
+function applyAtk(m){
+ if(me.dead||!round.on||round.over)return;
+ switch(m.k){
+  case'dmg':hurt(m.d||1);break;
+  case'slow':me.slow=3;banner='Webbed!';break;
+  case'scream':me.stun=2;breakArm(Math.random()<.5?0:1);break;
+  case'breakL':breakArm(0);break;case'breakR':breakArm(1);break;
+  case'armL':tearArm(0);break;case'armR':tearArm(1);break;
+  case'head':me.mask|=4;die('head');break;
+  case'half':me.mask|=8;die('half');break;}}
+
+// ================= REMOTE PLAYERS =================
+const remotes=new Map();
+function getRemote(id,name){let r=remotes.get(id);
+ if(!r){r={id,name,av:null,form:'human',col:0x44aaff,mask:0,team:'s',cloak:0,hitCd:0,seen:0,
+  cur:{h:new V3(),q:new THREE.Quaternion(),l:new V3(),r:new V3()},tg:{h:new V3(),q:new THREE.Quaternion(),l:new V3(),r:new V3()}};remotes.set(id,r)}
+ return r;}
+function setAv(r){if(r.av)scene.remove(r.av.g);r.av=makeAvatar(r.form,r.col);scene.add(r.av.g)}
+function updateRemotes(dt){const k=1-Math.exp(-15*dt);
+ for(const r of remotes.values()){r.hitCd-=dt;if(!r.av||!r.seen)continue;
+  r.cur.h.lerp(r.tg.h,k);r.cur.q.slerp(r.tg.q,k);r.cur.l.lerp(r.tg.l,k);r.cur.r.lerp(r.tg.r,k);
+  poseAvatar(r.av,r.cur.h,r.cur.q,r.cur.l,r.cur.r,r.mask);
+  r.av.g.visible=!(r.mask&128);r.av.mat.opacity=r.cloak?.1:1;}}
+
+// ================= NETWORK =================
+function net(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o))}
+function connect(){return new Promise(res=>{
+ if(SERVER_URL.includes('YOUR-SERVER')){res(false);return}
+ try{ws=new WebSocket(SERVER_URL)}catch(e){res(false);return}
+ const to=setTimeout(()=>res(false),5000);
+ ws.onopen=()=>net({t:'join',name:myName,mode:pickMode});
+ ws.onmessage=ev=>{let m;try{m=JSON.parse(ev.data)}catch(e){return}
+  if(m.t==='hi'){clearTimeout(to);myId=m.id;hostId=m.host;connected=true;m.players.forEach(p=>getRemote(p.id,p.name));banner='Waiting for round...';res(true)}
+  else onMsg(m)};
+ ws.onclose=()=>{connected=false;banner='Disconnected'};ws.onerror=()=>res(false)})}
+function onMsg(m){switch(m.t){
+ case's':{const r=getRemote(m.id);
+  if(!r.av||r.form!==m.f||r.col!==m.c){r.form=m.f;r.col=m.c;setAv(r)}
+  r.tg.h.set(m.h[0],m.h[1],m.h[2]);r.tg.q.set(m.h[3],m.h[4],m.h[5],m.h[6]);r.tg.l.set(m.l[0],m.l[1],m.l[2]);r.tg.r.set(m.r[0],m.r[1],m.r[2]);
+  r.mask=m.m;r.cloak=m.k;r.team=m.tm;
+  if(!r.seen){r.seen=1;r.cur.h.copy(r.tg.h);r.cur.q.copy(r.tg.q);r.cur.l.copy(r.tg.l);r.cur.r.copy(r.tg.r)}break}
+ case'join':getRemote(m.id,m.name);break;
+ case'leave':{const r=remotes.get(m.id);if(r){if(r.av)scene.remove(r.av.g);remotes.delete(m.id)}break}
+ case'host':hostId=m.id;break;
+ case'start':startRound(m);break;
+ case'end':endRound(m.msg);break;
+ case'atk':applyAtk(m);break;
+ case'fx':fxLocal(m.k,new V3(...m.p),new V3(...m.l),new V3(...m.r),m.c);break;
+ case'key':collectKey(m.i,false);break;
+ case'ai':applyAI(m);break;
+ case'aihit':if(isHost())hitAI(m.i);break;}}
+function sendState(){const q=camera.quaternion;
+ net({t:'s',h:[...r3(HP),+q.x.toFixed(3),+q.y.toFixed(3),+q.z.toFixed(3),+q.w.toFixed(3)],l:r3(hands[0].hw),r:r3(hands[1].hw),
+  f:me.disguise?'human':me.form,c:myColor(),m:me.mask,k:me.cloak>0?1:0,tm:me.team})}
+let netT=0;
+function netTick(dt){netT+=dt;if(netT<.05)return;netT=0;sendState();
+ if(isHost()&&connected)net({t:'ai',m:ai.map(a=>[+a.x.toFixed(1),+a.z.toFixed(1),a.hp])})}
+
+// ================= ROUNDS =================
+function startRound(m){
+ mode=m.mode;round={on:true,over:false,sent:false,end:performance.now()+m.left,t0:performance.now(),keys:0,monsterId:m.monsterId};
+ buildWorld(m.seed);
+ me.form=effForm();me.team=mode==='brawl'?'f':(mode==='monster'&&myId===round.monsterId?'m':'s');
+ me.hp=me.team==='m'?14:6;me.mask=0;me.dead=false;me.stun=0;me.slow=0;me.cloak=0;me.cd.a=0;me.disguise=null;
+ hands.forEach(h=>{h.anchor=null;h.grab=null});
+ rig.position.set((Math.random()-.5)*6,.5,(Math.random()-.5)*6);vel.set(0,0,0);wasTouch=false;
+ updateLook();
+ ai.forEach(a=>scene.remove(a.g));ai.length=0;
+ if(isHost()){const n=mode==='escape'?5:mode==='monster'?2:0;
+  for(let i=0;i<n;i++){const a=Math.random()*6.28,r=15+Math.random()*20;ai.push(makeAI(Math.cos(a)*r,Math.sin(a)*r))}}
+ banner=mode==='escape'?'Find 5 keys, reach the exit':mode==='monster'?(me.team==='m'?'You are the MONSTER. Hunt them.':'Survive! A monster is loose'):'BRAWL! Last ape standing'}
+function endRound(msg){round.over=true;banner=msg;sfx(300,.8,'sine')}
+function declareEnd(msg){if(round.over||round.sent)return;round.sent=true;
+ if(connected)net({t:'end',msg});
+ else{endRound(msg);setTimeout(()=>startRound({mode:pickMode,seed:Math.random()*1e9|0,monsterId:0,left:150000}),8000)}}
+
+// ================= AI MONSTERS (host-simulated) =================
+const ai=[];
+function makeAI(x,z){const g=new THREE.Group(),m=new THREE.MeshStandardMaterial({color:0x8a1a1a});
+ const b=new THREE.Mesh(new THREE.BoxGeometry(.9,1.8,.5),m);b.position.y=.9;
+ const hd=new THREE.Mesh(new THREE.SphereGeometry(.3,12,10),m);hd.position.y=2;
+ const ey=new THREE.Mesh(new THREE.BoxGeometry(.3,.06,.05),new THREE.MeshBasicMaterial({color:0xff2222}));ey.position.set(0,2.03,.28);
+ g.add(b,hd,ey);scene.add(g);return{g,x,z,tx:x,tz:z,hp:3,cd:0,hitCd:0,ry:0}}
+function aiTargets(){const t=[];
+ if(!me.dead&&!(mode==='monster'&&me.team==='m'))t.push({me:1,p:HP});
+ for(const r of remotes.values())if(!(r.mask&128)&&r.seen&&!(mode==='monster'&&r.team==='m'))t.push({id:r.id,p:r.cur.h});
+ return t;}
+function applyAI(m){if(isHost())return;
+ while(ai.length<m.m.length)ai.push(makeAI(m.m[ai.length][0],m.m[ai.length][1]));
+ while(ai.length>m.m.length)scene.remove(ai.pop().g);
+ m.m.forEach((d,i)=>{ai[i].tx=d[0];ai[i].tz=d[1];ai[i].hp=d[2]})}
+function hitAI(i){const a=ai[i];if(!a)return;a.hp--;a.hitCd=.4;blood(new V3(a.x,1.2,a.z),12);
+ const dx=a.x-HP.x,dz=a.z-HP.z,d=Math.hypot(dx,dz)||1;a.x+=dx/d*.8;a.z+=dz/d*.8;
+ if(a.hp<=0){scene.remove(a.g);ai.splice(i,1)}}
+function updateAI(dt){const host=isHost(),T=host?aiTargets():null;
+ for(let i=ai.length-1;i>=0;i--){const a=ai[i];a.hitCd-=dt;
+  if(host){a.cd-=dt;let t=null,bd=40;
+   for(const c of T){const d=Math.hypot(c.p.x-a.x,c.p.z-a.z);if(d<bd){bd=d;t=c}}
+   if(t&&!round.over){const dx=t.p.x-a.x,dz=t.p.z-a.z,d=Math.hypot(dx,dz)||1;a.ry=Math.atan2(dx,dz);
+    if(d>.9){a.x+=dx/d*2.6*dt;a.z+=dz/d*2.6*dt}
+    else if(a.cd<=0&&t.p.y<2.4){a.cd=1.3;
+     if(t.me)hurt(1);else net({t:'atk',to:t.id,k:Math.random()<.25?(Math.random()<.5?'breakL':'breakR'):'dmg',d:1})}}
+  }else{const dx=a.tx-a.x,dz=a.tz-a.z;if(Math.hypot(dx,dz)>.05)a.ry=Math.atan2(dx,dz);
+   a.x+=dx*Math.min(1,12*dt);a.z+=dz*Math.min(1,12*dt)}
+  a.g.position.set(a.x,0,a.z);a.g.rotation.y=a.ry;}}
+
+// ================= LOCOMOTION (Gorilla Tag style) =================
+function updateHands(dt){for(const h of hands){const cur=h.c.position;if(h.first){h.prev.copy(cur);h.first=false}
+ h.delta.copy(cur).sub(h.prev);h.speed=h.delta.length()/dt;h.prev.copy(cur);h.hw.copy(cur).add(rig.position)}}
+function refreshHW(){camera.getWorldPosition(HP);for(const h of hands)h.hw.copy(h.c.position).add(rig.position)}
+function locomotion(dt){let touch=0;
+ for(let i=0;i<2;i++){const h=hands[i];h.wasT=h.touching;h.touching=false;
+  const gone=me.mask&(1<<i);h.mesh.visible=!gone;
+  h.mesh.scale.setScalar((me.form==='human'||me.disguise?1:1.4)*(me.mask&(16<<i)?.7:1));
+  if(gone||me.stun>0){h.anchor=null;continue}
+  const cur=h.c.position,grip=h.gp&&h.gp.buttons[1]&&h.gp.buttons[1].pressed,spider=me.form==='spider'&&grip;
+  if(spider&&h.anchor){_hw.copy(cur).add(rig.position);rig.position.add(_d2.copy(h.anchor).sub(_hw));h.touching=true;h.vel.set(0,0,0);touch++;continue}
+  h.anchor=null;
+  _hw.copy(cur).add(rig.position);
+  if(pushOut(_hw,HAND_R,_hn)>0){
+   rig.position.sub(h.delta);_hw.copy(cur).add(rig.position);
+   const d2=pushOut(_hw,HAND_R,_hn);if(d2>0)rig.position.addScaledVector(_hn,d2);
+   h.vel.copy(h.delta).multiplyScalar(-1/dt*(me.mask&(16<<i)?.5:1));
+   if(!h.wasT)haptic(h,.4,40);
+   h.touching=true;touch++;
+   if(spider)h.anchor=_hw.clone();}}
+ if(touch>0){vel.set(0,0,0);wasTouch=true}
+ else{
+  if(wasTouch){let b=null;for(const h of hands)if(h.wasT&&(!b||h.vel.lengthSq()>b.vel.lengthSq()))b=h;
+   vel.copy(b?b.vel:_zero);if(vel.length()>MAXL)vel.setLength(MAXL);if(me.slow>0)vel.multiplyScalar(.4);wasTouch=false}
+  vel.y-=GRAV*dt;vel.multiplyScalar(1-.15*dt);rig.position.addScaledVector(vel,dt)}
+ camera.getWorldPosition(_hw);const hd=pushOut(_hw,.15,_hn);
+ if(hd>0){rig.position.addScaledVector(_hn,hd);if(vel.dot(_hn)<0)vel.addScaledVector(_hn,-vel.dot(_hn))}}
+
+// ================= COMBAT / ABILITIES =================
+const canHit=r=>mode==='escape'?false:mode==='monster'?r.team!==me.team:true;
+function edge(h,i){const b=h.gp&&h.gp.buttons[i],p=!!(b&&b.pressed),e=p&&!h.pb[i];h.pb[i]=p;return e}
+function nearestTarget(maxD,needHit){let best=null,bd=maxD;
+ for(const r of remotes.values()){if(r.mask&128||!r.seen)continue;if(needHit&&!canHit(r))continue;
+  const d=r.cur.h.distanceTo(HP);if(d<bd){bd=d;best=r}}return best}
+function abilities(dt){
+ const A=edge(hands[0],4)|edge(hands[1],4),B=edge(hands[0],5)|edge(hands[1],5);
+ if(me.dead||me.stun>0)return;
+ if(A){
+  if(me.form==='shifter'){const r=nearestTarget(3,false);if(r){me.disguise={col:r.col};updateLook();sfx(300,.3,'sine');banner='Disguised!'}}
+  else if(me.form==='banshee'&&me.cd.a<=0){me.cd.a=12;sfx(900,1);
+   for(const r of remotes.values())if(!(r.mask&128)&&canHit(r)&&r.cur.h.distanceTo(HP)<8)net({t:'atk',to:r.id,k:'scream'})}
+  else if(me.form==='phantom'&&me.cd.a<=0){me.cd.a=12;me.cloak=6;sfx(200,.4,'sine')}}
+ if(B){
+  if(me.form==='shifter'){me.disguise=null;updateLook()}
+  else if(me.form==='spider'){const r=nearestTarget(12,true);if(r){net({t:'atk',to:r.id,k:'slow'});sfx(500,.2,'triangle')}}}}
+function hit(r,hi,sp,p){
+ const arm=p.distanceTo(r.av.sL)<p.distanceTo(r.av.sR)?0:1,bit=16<<arm,nm=arm?'R':'L';
+ haptic(hands[hi],1,120);sfx(100,.12);
+ if(me.disguise){net({t:'atk',to:r.id,k:'head'});me.disguise=null;updateLook();return}
+ if(me.form==='crusher'&&sp>3)net({t:'atk',to:r.id,k:(r.mask&bit?'arm':'break')+nm});
+ else if(me.form!=='human'&&sp>4.5&&!(r.mask&bit))net({t:'atk',to:r.id,k:'break'+nm});
+ net({t:'atk',to:r.id,k:'dmg',d:(me.form==='human'?1:2)*(me.cloak>0?2:1)});me.cloak=0}
+function combat(){
+ if(me.dead||me.stun>0)return;
+ for(let i=0;i<2;i++){const h=hands[i];if(me.mask&(1<<i)||h.speed<2.2)continue;const p=h.hw;
+  for(let j=ai.length-1;j>=0;j--){const a=ai[j];if(a.hitCd>0)continue;
+   if(Math.hypot(p.x-a.x,p.z-a.z)<.7&&p.y<2.3){a.hitCd=.4;haptic(h,1,100);sfx(120,.1);if(isHost())hitAI(j);else net({t:'aihit',i:j})}}
+  for(const r of remotes.values()){if(r.mask&128||r.hitCd>0||!canHit(r)||!r.av)continue;
+   const dh=p.distanceTo(r.cur.h);_a.copy(r.av.neck);_a.y-=.3;
+   if(dh<.3||p.distanceTo(_a)<.35){r.hitCd=.5;hit(r,i,h.speed,p)}}}}
+function grabs(){ // Brute: rip mechanic
+ if(me.form!=='brute'||me.dead||me.stun>0){hands.forEach(h=>h.grab=null);return}
+ for(let i=0;i<2;i++){const h=hands[i],b=h.gp&&h.gp.buttons[1],g=!!(b&&b.pressed);
+  if(!g||(me.mask&(1<<i))){h.grab=null;continue}
+  const p=h.hw;
+  if(!h.grab){
+   for(const r of remotes.values()){if(r.mask&128||!canHit(r)||!r.av)continue;
+    _a.copy(r.av.neck);_a.y-=.3;let part=null;
+    if(p.distanceTo(r.cur.h)<.3&&!(r.mask&4))part='head';
+    else if(p.distanceTo(r.cur.l)<.25&&!(r.mask&1))part='armL';
+    else if(p.distanceTo(r.cur.r)<.25&&!(r.mask&2))part='armR';
+    else if(p.distanceTo(_a)<.35&&!(r.mask&8))part='torso';
+    if(part){h.grab={r,part};haptic(h,.6,60);break}}
+  }else{
+   const{r,part}=h.grab;if(r.mask&128||!remotes.has(r.id)){h.grab=null;continue}
+   let done=null;
+   if(part==='head'&&p.distanceTo(r.av.neck)>.75)done='head';
+   else if(part==='armL'&&p.distanceTo(r.av.sL)>1)done='armL';
+   else if(part==='armR'&&p.distanceTo(r.av.sR)>1)done='armR';
+   if(done){net({t:'atk',to:r.id,k:done});haptic(h,1,300);sfx(70,.4);h.grab=null}}}
+ const g0=hands[0].grab,g1=hands[1].grab;
+ if(g0&&g1&&g0.r===g1.r&&g0.part==='torso'&&g1.part==='torso'&&hands[0].hw.distanceTo(hands[1].hw)>1.1){
+  net({t:'atk',to:g0.r.id,k:'half'});hands.forEach(h=>{h.grab=null;haptic(h,1,400)});sfx(60,.6)}}
+
+// ================= KEYS / EXIT =================
+function collectKey(i,local){const k=keys[i];if(!k||k.got)return;k.got=true;k.m.visible=false;round.keys++;sfx(700,.2,'sine');
+ if(local)net({t:'key',i});
+ if(round.keys>=5){exitMesh.material.color.setHex(0x22dd44);banner='Exit is open!'}}
+function pickups(){if(mode!=='escape')return;
+ for(let i=0;i<keys.length;i++){const k=keys[i];if(k.got)continue;
+  for(const h of hands)if(h.hw.distanceTo(k.m.position)<.4){collectKey(i,true);break}}
+ if(round.keys>=5&&!me.dead&&HP.distanceTo(exitPos)<2.2)declareEnd('Survivors ESCAPED!')}
+
+// ================= HOST WIN CHECKS =================
+let hostT=0;
+function hostLogic(dt){if(!isHost()||round.over)return;hostT+=dt;if(hostT<1)return;hostT=0;
+ if(performance.now()-round.t0<4000)return;
+ const all=[{team:me.team,dead:me.dead},...[...remotes.values()].map(r=>({team:r.team,dead:!!(r.mask&128)}))];
+ const alive=all.filter(p=>!p.dead);
+ if(mode==='escape'&&alive.length===0)declareEnd('Everyone died. Monsters win');
+ if(mode==='monster'){const s=all.filter(p=>p.team==='s');if(s.length&&s.every(p=>p.dead))declareEnd('The Monster wins!')}
+ if(mode==='brawl'&&all.length>1&&alive.length<=1)declareEnd(alive.length?'Last ape standing wins!':'Everybody died')}
+function timers(dt){me.stun=Math.max(0,me.stun-dt);me.slow=Math.max(0,me.slow-dt);me.cloak=Math.max(0,me.cloak-dt);me.cd.a=Math.max(0,me.cd.a-dt)}
+
+// ================= MAIN LOOP =================
+const clock=new THREE.Clock();let hudT=0;
+renderer.setAnimationLoop(()=>{const dt=Math.min(clock.getDelta(),.05);
+ if(renderer.xr.isPresenting){
+  camera.getWorldPosition(HP);updateHands(dt);
+  if(round.on){locomotion(dt);refreshHW();
+   if(!round.over){abilities(dt);grabs();combat();pickups()}
+   updateAI(dt);hostLogic(dt);timers(dt)}
+  netTick(dt);hudT+=dt;if(hudT>.25){hudT=0;drawHUD()}}
+ updateRemotes(dt);updChunks(dt);renderer.render(scene,camera)});
+
+// ================= ENTER VR =================
+$('enter').onclick=async()=>{
+ myName=$('name').value||myName;pickMode=$('mode').value;
+ if(!navigator.xr){$('status').textContent='WebXR unavailable. Open in the Quest Browser over HTTPS.';return}
+ try{
+  const s=await navigator.xr.requestSession('immersive-vr',{optionalFeatures:['local-floor']});
+  renderer.xr.setReferenceSpaceType('local-floor');await renderer.xr.setSession(s);
+  $('menu').style.display='none';
+  s.addEventListener('end',()=>{$('menu').style.display='';if(ws)ws.close();round.on=false});
+  banner='Connecting...';
+  const ok=await connect();
+  if(!ok){myId=0;connected=false;banner='Solo mode';startRound({mode:pickMode,seed:Math.random()*1e9|0,monsterId:0,left:150000})}
+ }catch(e){$('status').textContent=e.message}};
+addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+</script></body></html>
