@@ -322,6 +322,7 @@ function declareEnd(msg){if(round.over||round.sent)return;round.sent=true;
  else{endRound(msg);setTimeout(()=>startRound({mode:pickMode,seed:Math.random()*1e9|0,monsterId:0,left:150000}),8000)}}
 
 // ================= AI MONSTERS (host-simulated) =================
+const ai=[];
 function makeAI(x,z){
  const g=new THREE.Group();
  const fur=new THREE.MeshStandardMaterial({color:0x6a1414}),
@@ -356,11 +357,8 @@ function makeAI(x,z){
   const arm=new THREE.Mesh(new THREE.CylinderGeometry(.15,.1,1.2,8),fur);arm.position.y=-.6;pivot.add(arm);
   const hand=makeHand(fur,true);hand.scale.setScalar(2.4);hand.rotation.z=Math.PI;hand.position.y=-1.25;pivot.add(hand);
   g.add(pivot);arms.push(pivot);}
- // swing the arms while it walks
- body.onBeforeRender=()=>{const t=performance.now()/1000*5;arms[0].rotation.x=Math.sin(t)*.6;arms[1].rotation.x=-Math.sin(t)*.6};
  scene.add(g);
- return{g,x,z,tx:x,tz:z,hp:3,cd:0,hitCd:0,ry:0}}
- g.add(b,hd,ey);scene.add(g);return{g,x,z,tx:x,tz:z,hp:3,cd:0,hitCd:0,ry:0}}
+ return{g,arms,x,z,tx:x,tz:z,hp:3,cd:0,hitCd:0,ry:0}}
 function aiTargets(){const t=[];
  if(!me.dead&&!(mode==='monster'&&me.team==='m'))t.push({me:1,p:HP});
  for(const r of remotes.values())if(!(r.mask&128)&&r.seen&&!(mode==='monster'&&r.team==='m'))t.push({id:r.id,p:r.cur.h});
@@ -372,7 +370,7 @@ function applyAI(m){if(isHost())return;
 function hitAI(i){const a=ai[i];if(!a)return;a.hp--;a.hitCd=.4;blood(new V3(a.x,1.2,a.z),12);
  const dx=a.x-HP.x,dz=a.z-HP.z,d=Math.hypot(dx,dz)||1;a.x+=dx/d*.8;a.z+=dz/d*.8;
  if(a.hp<=0){scene.remove(a.g);ai.splice(i,1)}}
-function updateAI(dt){const host=isHost(),T=host?aiTargets():null;
+function updateAI(dt){const host=isHost(),T=host?aiTargets():null,sw=performance.now()/1000*5;
  for(let i=ai.length-1;i>=0;i--){const a=ai[i];a.hitCd-=dt;
   if(host){a.cd-=dt;let t=null,bd=40;
    for(const c of T){const d=Math.hypot(c.p.x-a.x,c.p.z-a.z);if(d<bd){bd=d;t=c}}
@@ -382,7 +380,8 @@ function updateAI(dt){const host=isHost(),T=host?aiTargets():null;
      if(t.me)hurt(1);else net({t:'atk',to:t.id,k:Math.random()<.25?(Math.random()<.5?'breakL':'breakR'):'dmg',d:1})}}
   }else{const dx=a.tx-a.x,dz=a.tz-a.z;if(Math.hypot(dx,dz)>.05)a.ry=Math.atan2(dx,dz);
    a.x+=dx*Math.min(1,12*dt);a.z+=dz*Math.min(1,12*dt)}
-  a.g.position.set(a.x,0,a.z);a.g.rotation.y=a.ry;}}
+  a.g.position.set(a.x,0,a.z);a.g.rotation.y=a.ry;
+  if(a.arms){a.arms[0].rotation.x=Math.sin(sw)*.6;a.arms[1].rotation.x=-Math.sin(sw)*.6}}}
 
 // ================= LOCOMOTION (Gorilla Tag style) =================
 function updateHands(dt){for(const h of hands){const cur=h.c.position;if(h.first){h.prev.copy(cur);h.first=false}
@@ -440,7 +439,7 @@ function combat(){
  if(me.dead||me.stun>0)return;
  for(let i=0;i<2;i++){const h=hands[i];if(me.mask&(1<<i)||h.speed<2.2)continue;const p=h.hw;
   for(let j=ai.length-1;j>=0;j--){const a=ai[j];if(a.hitCd>0)continue;
-   if(Math.hypot(p.x-a.x,p.z-a.z)<.7&&p.y<2.3){a.hitCd=.4;haptic(h,1,100);sfx(120,.1);if(isHost())hitAI(j);else net({t:'aihit',i:j})}}
+   if(Math.hypot(p.x-a.x,p.z-a.z)<.9&&p.y<2.5){a.hitCd=.4;haptic(h,1,100);sfx(120,.1);if(isHost())hitAI(j);else net({t:'aihit',i:j})}}
   for(const r of remotes.values()){if(r.mask&128||r.hitCd>0||!canHit(r)||!r.av)continue;
    const dh=p.distanceTo(r.cur.h);_a.copy(r.av.neck);_a.y-=.3;
    if(dh<.3||p.distanceTo(_a)<.35){r.hitCd=.5;hit(r,i,h.speed,p)}}}}
